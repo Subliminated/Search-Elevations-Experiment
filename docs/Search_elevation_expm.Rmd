@@ -1,0 +1,455 @@
+---
+title: "Search Elevations Experiment"
+author: "Gordon Lam"
+date: "01/08/2022"
+output: html_document
+---
+# Recommendation Summary 
+It is recommended to continue the use of manual elevations for existing queries that have already been manually elevated as opposed to switching to automated elevations. To ensure the customer's outcomes are achieved, the customer's engagement rate (i.e total customers exporting/paying for license) was used as the primary measure of success and finds in favor of continuing the use of manual elevations.
+
+Elevations refers to the mechanism of returning search query results to the user.
+Manual elevations refers to search query results or media is manually mapped and tagged against catalog of searchable terms.
+Automated elevations refers to use of automated algorithm to return query results to the user.
+
+Import packages and data
+```{r echo = T, results= 'hide', warning=FALSE, message=FALSE}
+library(tidyverse)
+library(lubridate)
+
+#Import data
+file_dir <- "~/Documents/GitHub/Search Elevation"
+setwd(file_dir)
+exp_data <- read_csv("manual_elevations_experiment_data.csv")
+```
+
+Data Exploration
+```{r}
+# Data types
+head(exp_data) 
+```
+Total count of data for entire period
+```{r}
+message(exp_data %>% nrow())
+```
+
+Daily Volumes
+```{r}
+daily_volume <- exp_data %>% 
+    group_by(experiment_day,experiment_group) %>%
+    summarise(
+      total_click = sum(num_clicks),
+      total_exported = sum(num_exported_results),
+      total_license = sum(num_licenses)
+    ) %>%
+    arrange(experiment_day)
+
+#total clicks
+ggplot(data=daily_volume, aes(x=experiment_day, y=total_click, group=experiment_group)) +
+  geom_line(aes(colour=experiment_group)) +
+  geom_point(aes(colour=experiment_group)) +
+  print(ggtitle("Total clicks daily"))
+
+#total exported
+ggplot(data=daily_volume, aes(x=experiment_day, y=total_exported, group=experiment_group)) +
+  geom_line(aes(colour=experiment_group)) +
+  geom_point(aes(colour=experiment_group)) +
+  print(ggtitle("Total exported daily"))
+
+#total license
+ggplot(data=daily_volume, aes(x=experiment_day, y=total_license, group=experiment_group)) +
+  geom_line(aes(colour=experiment_group)) +
+  geom_point(aes(colour=experiment_group)) +
+  print(ggtitle("Total license daily"))
+```
+Snapshot into 'seasonality'
+```{r}
+#Why does it trough?
+exp_data %>% 
+    group_by(experiment_day) %>%
+    summarise(
+      total_click = sum(num_clicks)
+    ) %>%
+    #10k-20k is some arbitrary lower and upper bound for the troughs
+    filter(total_click >= 10000 & total_click <= 20000) 
+```
+Findings: <br>
+  - every 5 days or so, there is a 2 day trough. Most likely due to weekend, there is lower engagement
+
+# Data Quality checks
+## 1) Data drop out
+```{r}
+exp_data %>% 
+    group_by(experiment_day) %>%
+    summarise(
+      total_click = sum(num_clicks)
+    ) %>%
+    filter(total_click <= 2500) %>%
+    arrange(experiment_day)  
+```
+Note: Selected 2500 arbitrarily because the min clicks when grouped by day by exp group was slightly lower than 5000 (see chart) <br>
+
+Findings: <br>
+  - Several days with clear drop outs in data
+
+## 2) Num_elevations should only apply to group by A
+Based on data dictionary - these are related to manual elevations
+```{r}
+# Store problematic queries
+dq_search_2 <- exp_data %>%
+  filter(experiment_group == 'B' & num_elevations > 0) 
+dq_search_2
+```
+Findings: <br>
+  - Group B has 59 rows that have manual elevation when it should be entirely automated
+
+## 3) Duplication checks
+Data duplication checks - each search id must be unique
+```{r}
+# Data duplication
+# Store problematic queries
+dq_search_3 <- exp_data %>%
+  group_by(search_id) %>%
+  filter(n() >= 2) 
+dq_search_3
+```
+Findings: <br>
+  - 2 duplicated search IDs for clearly different records from 4 different users
+
+## 4) Null checks
+Null fields - fields with missing data
+```{r}
+#Find columns that have NA's in them
+#1) For each column in the df, convert to logical then sum values == true
+null_vectors <- colSums(is.na(exp_data) > 0)
+colnames(exp_data)[null_vectors > 0]
+
+# Store problematic records
+dq_search_4 <- 
+exp_data %>%
+  filter(is.na(query))
+dq_search_4
+```
+Findings: <br>
+  - 2 rows that have null values from the search query
+
+## 5) Column checks for validity
+```{r}
+#experiment groups
+exp_data %>%
+  group_by(experiment_group) %>%
+  summarise(count = n())
+#user tier
+exp_data %>%
+  group_by(user_tier) %>%
+  summarise(count = n())
+#media types
+exp_data %>%
+  group_by(media_types) %>%
+  summarise(count = n())
+#query
+exp_data %>%
+  group_by(query) %>%
+  summarise(count = n())
+
+# Store problematic records
+dq_search_5 <- 
+exp_data %>%
+  filter(experiment_group == 'S')
+dq_search_5
+```
+Findings: <br>
+  - Experiment_group has erroneous group 'S'  <br>
+  - 336 unique queries with some, completely unreadable e.g. "brand:BABCTFGu9Rg^100 tropical"
+
+## 6) Experimental setup check
+JOIN queries_with_elevations qe <br>
+  ON s.query = qe.query <br>
+  AND s.media_types = qe.media_types <br>
+  AND s.user_tier = qe.user_tier <br>
+  CROSS JOIN min_search_date msd
+
+The impact of this join is that, only queries (of a particular media_type and user_tier) from experiment A are fully included.
+This means that all experiment A are queries that have manual elevations. Experiment B however may have queries that are left out.
+
+Check experiment design - is the experiment group set up properly?
+```{r}
+#Check number of 
+exp_data %>% 
+  group_by(experiment_group) %>%
+  summarise(dist_group = n_distinct(query,media_types,user_tier))
+
+# check how many distinct groups each query has
+query_dist <- exp_data %>% 
+  group_by(query,media_types,user_tier) %>%
+  summarise(dist_exp_groups = n_distinct(experiment_group)) %>%
+  filter(dist_exp_groups != 2)
+query_dist
+
+#Exclude 'christmas' as it has more than 2 group and store problematic queries
+dq_search_6 <- exp_data %>%
+  inner_join(query_dist, by = c("query","media_types","user_tier")) %>%
+  select(-dist_exp_groups) %>%
+  filter(query != "christmas") %>%
+  arrange(experiment_group)
+dq_search_6
+```
+Finding: <br>
+  - Based on the script, only distinct queries by media_types by user tiers, from experiment A with > 0 no. elevations are counted. This means only records from that match the join condition from A should appear. Potentially this can impact experiment group B as the users from group B may not make the same search query in the period (potentially fewer records assessed) <br>
+  - There are 23 more distinct groups in A than there are in B <br>
+  - Interestingly, there are groups that only exist in B not found in A - Likely due to some items in group B classified as group A (related to above issue)
+
+## 7) Exports before clicks
+Is it possible to export/pay for license without click?
+```{r}
+# Check if it is possible to have exports/pay for license prior to click
+exp_data %>%
+  filter(num_clicks == 0 & num_exported_results + num_licenses >= 1) %>%
+  nrow()
+
+exp_data %>%
+  filter(num_exported_results == 0 & num_licenses >= 1) %>%
+  nrow()
+```
+Therefore assume that the exports/pay for license must be made with records into click
+
+#### Insights...
+- Seasonality in Data - decrease in data volumes appear to be every 5 days for roughly a 2-day period. This could indicate decrease in searches generally on the weekend. 
+- Data quality issues...
+  1) Experiment_group - erroneous 'S' type -> Remove 'S' type for experiment
+  2) Limited data recorded for experiment_day between 23-34 -> Check volume of data
+  3) Group B has 59 rows with > 0 manual elevations (should be 0?) -> Remove 
+  4) Duplication on 2 search_ids -> Either remove or re-assign new id
+  5) NA shows that 2 records are returned for empty query -> Remove
+  6) Unfair distribution of records in experiment group A -> Only keep distinct query, media types, user tiers that intersect
+
+# Data Cleaning
+Aggregate rows to remove then do a set difference to keep only values in A that are common. 
+```{r}
+discard_search_ids <- dq_search_2 %>%
+  union(dq_search_3) %>%
+  union(dq_search_4) %>%
+  union(dq_search_5) %>%
+  union(dq_search_6)
+
+#Consider after day 34
+clean_data <- exp_data %>%
+  filter(experiment_day > 34) %>%
+  setdiff(discard_search_ids)
+  #anti_join(discard_search_ids,by = c("search_id")) 
+
+#Impact of data removal
+message(sprintf('%s%%',round(
+                      nrow(discard_search_ids)*100/
+                      nrow(exp_data %>%
+                        filter(experiment_group != 'S', experiment_day > 34)
+                      ),digits = 2)
+                )
+        )
+```
+We consider after day 34 because... <br>
+  1) Stitching up dates will affect the analysis of 'impact' of manual elevation <br>
+  2) Sufficient data for experimentation post day 34
+
+------------------------------------------------------------------------------------------------------------------------------------------------
+
+# 1) Intial exploration of data
+Specific measures (over period of cleaned data from group A): <br>
+  1) Engagement volume trend - to monitor performance on day-to-day <br>
+  2) Average number of clicks - To see how long it takes a customer to find what they want <br>
+  3) % of customers who engaged (export/licence) as proportion of customers who clicked <br>
+  4) Query level breakdown of above metric - since there are only a few hundred - would be interesting to see top and bottom elevations and work out why the bottom elevations aren't doing well <br>
+  5) Conversion funnel - customers are clicking and also exporting/purchasing license for images
+
+Metrics to build for 'overall' impact of manual elevation
+```{r, include=FALSE}
+#Filter for only data from A
+manual_elevations_data <- clean_data %>% 
+  filter(experiment_group == 'A')
+manual_elevations_data 
+```
+
+```{r}
+#Daily volumes line chart
+daily_volume <- manual_elevations_data %>% 
+    group_by(experiment_day) %>%
+    summarise(
+      total_click = sum(num_clicks),
+      total_exported = sum(num_exported_results),
+      total_license = sum(num_licenses)
+    ) %>%
+    pivot_longer(col = 2:4, names_to = "engagement_type", values_to = "total_engagement") %>%
+    arrange(experiment_day) 
+
+ggplot(data=daily_volume, aes(x=experiment_day, y=total_engagement, group_by = engagement_type)) +
+  geom_line(aes(colour=engagement_type)) +
+  geom_point(aes(colour=engagement_type)) +
+  ggtitle("Total daily engagement")
+
+#Average number of clicks - remove 0's as the search 
+message(sprintf('Average number of clicks: %s',round(manual_elevations_data %>% 
+  summarise(avg_click = mean(num_clicks)),2)
+))
+
+message(sprintf('Average number of clicks (click > 0): %s',round(manual_elevations_data %>% 
+  filter(num_clicks > 0) %>%
+  summarise(avg_click = mean(num_clicks)),2)
+))
+
+#Export to click ratio
+message(sprintf('Export to click ratio: %s',
+        round(
+          nrow(manual_elevations_data %>%
+            filter(num_exported_results > 0)) /
+          nrow(manual_elevations_data %>%
+            filter(num_clicks > 0))
+        ,2)
+))
+#License to click ratio
+message(sprintf('License to click ratio: %s',
+        round(
+          nrow(manual_elevations_data %>%
+            filter(num_licenses > 0)) /
+          nrow(manual_elevations_data %>%
+            filter(num_clicks > 0))
+        ,2)
+))
+
+#Search bounce rate - users who have made a search query but have not made any clicks
+#Logic: num of searches == 0 / total searches 
+message(sprintf('Search bounce rate: %s',
+round(nrow(manual_elevations_data %>% filter(num_clicks == 0))/
+nrow(manual_elevations_data), digits = 2)))
+
+#Search query performance - acted means the customer has exported/purchased license
+search_data <- manual_elevations_data %>%
+  mutate(acted = ifelse(num_exported_results + num_licenses > 0,1,0)) %>%
+  group_by(query) %>%
+  summarise(
+    total_acted = sum(acted),
+    total_query = n(),
+    engagement_rate = round(sum(acted)/n(),2)
+  ) %>%
+  arrange(desc(engagement_rate),total_query)
+head(search_data,10)
+tail(search_data,10)
+
+#Conversion funnel
+df <- manual_elevations_data %>%
+  summarise(
+    queries = n_distinct(user_id),
+    clicks = n_distinct(user_id[num_clicks > 0]),
+    exported = n_distinct(user_id[num_exported_results > 0]),
+    license  = n_distinct(user_id[num_licenses > 0]),
+  ) %>%
+  pivot_longer(1:4, names_to = "no_", values_to = "num_cust") %>%
+  mutate(id = row_number()) %>%
+  arrange(desc(num_cust))
+
+ggplot(data=df, aes(x = reorder(no_,id,decreasing = TRUE), y=num_cust)) +
+  geom_bar(stat="identity", fill = "light blue") + 
+  geom_text(aes(label = signif(num_cust)), nudge_y = 0) +
+  coord_flip() + 
+  ylab("No. unique users") + 
+  xlab("Activity") +
+  ggtitle("User Journey Funnel")
+```
+
+# 2) Experimentation approach
+### Define outcome of experiment - What is the goal of the experimentation?
+To improve customer engagement and conversions to exports and sales, a new automated elevation mechanism has been developed for the search function. The experiment will help us determine whether the new method for elevation is provides more relevant content to our customers on the web platform.
+
+Commentary: We could also include a financial outcome which would be more pragmatic, though the data somewhat better serves for an outcome that is customer/engagement centric.
+
+### Define hypothesis and behaviors - How do we expect customers to behave:
+#### Hypothesis: 
+We believe that having a reliable search function that provides relevant and curated content to a user's search query will impact their decision to choose, use and/or pay for content (images) from the web platform. 
+
+By implementing automated elevations, we will be able to provide elevations across a broader range of queries in a timely manner and therefore ensure that content for users are useful and relevant 
+
+We know this is true if we see a significant uplift in user engagement rates and fall in the search bounce rate
+
+- Preferred: 
+  1. Customers are making more exports and number of licenses with content from their search query results
+  2. Customers who make a search can find their content relatively quickly (few search results)
+- Least preferred: 
+  1. Customers are making queries but does not end up clicking, exporting or purchasing a license 
+  2. Customers making more searches 
+
+### Key Success metrics - How we will measure customer behaviour and determine if outcome is met
+We know that our hypothesis is true when: <br>
+  1) Click-through volumes (since engagement volumes may be higher for more relevant content) <br>
+  2) Proportion of customers converted to export/licensing over total clicks
+
+### Statistical inferences
+- Implement proportion significance testing to compare volumes of observed data to understand whether the differences are material or if due to possible fluctuations in the between experiment group <br>
+
+  How:
+  (1) H0: There is no difference between <proportion> between the two populations
+  (2) HA: There is a difference (two sided)
+  
+What can we do with this analysis? <br>
+  Proportion testing will help us understand whether a metric is considered significant or not, e.g. is 6% vs   7% considered important?
+  Understanding which measures are significant will affect the conclusions we can draw about the two            experiment groups and therefore the final recommendation.
+
+# Completed analysis 
+Priority of metrics <br>
+  1) Proportion of customers converted to export/licensing over total clicks
+    - Since conversion is an important driver of how relevant images are to customers <br>
+  2) Click-through volumes (since engagement volumes may be higher for more relevant content)
+    - Click through can be noisy - since customers may click on things that may not be relevant to them
+
+```{r}
+metric_data <- clean_data %>%
+  group_by(experiment_group) %>%
+  summarise(
+    #counts
+    records = n(),
+    cust_total = n_distinct(user_id), #Total number of customers
+    cust_clicks = n_distinct(user_id[num_clicks > 0]), #Total customers that have clicked
+    cust_export = n_distinct(user_id[num_exported_results> 0]), #Total customers that have exported
+    cust_license = n_distinct(user_id[num_licenses> 0]), #Total customers that have paid for a design
+    cust_engaged = n_distinct(user_id[num_exported_results + num_licenses > 0]), #Total number of customers that have exported/paid for design
+    #metrics - user level
+    click_rate = round(cust_clicks/cust_total,4), 
+    export_rate = round(cust_export/cust_clicks,4),
+    license_rate = round(cust_license/cust_clicks,4),
+    eng_rate = round(cust_engaged/cust_clicks,4),
+    avg_clicks = round(sum(num_clicks)/cust_total,2),
+    avg_exports = round(sum(num_exported_results)/cust_total,2),
+    avg_license = round(sum(num_licenses)/cust_total,2)
+  ) 
+
+metric_data %>%
+  select(experiment_group,click_rate,export_rate,license_rate,eng_rate,avg_clicks, avg_exports, avg_license)
+
+#Sig. test
+alpha = 0.05 #significance
+confidence = 1-alpha
+
+message(colnames(metric_data)[8])
+print(prop.test(x=  metric_data %>% pull(cust_clicks), n = metric_data %>% pull(cust_total),
+          conf.level=confidence))
+message(colnames(metric_data)[9])
+print(prop.test(x=  metric_data %>% pull(cust_export), n = metric_data %>% pull(cust_clicks),
+          conf.level=confidence))
+message(colnames(metric_data)[10])
+print(prop.test(x=  metric_data %>% pull(cust_license), n = metric_data %>% pull(cust_clicks),
+          conf.level=confidence))
+message(colnames(metric_data)[11])
+print(prop.test(x=  metric_data %>% pull(cust_engaged), n = metric_data %>% pull(cust_clicks),
+          conf.level=confidence))
+```
+Note: we calculate the above metrics at a customer level as it is easier to determine proportions.
+
+The p-value of the test is 2.2e-16, which is less than the significance level alpha = 0.05 for all metrics. 
+We can conclude that the proportion of smokers is significantly different in the two groups across all proportions
+
+Insights: <br>
+  - Based on the click-through rate, Customers in group B is clicking more than group A and this is supported by the avg number of clicks per user 3.77 > 3.54. Despite this, the overall engagement of the customer in group B is lower, mainly due to customers not converting as much (engagement refers to paying for license or exports). This suggest that elevated content is interesting but may not be as relevant to the customer's need. <br>
+  - When we look at licensing individually, we see that customers are more likely pay for the license. <br>
+  - We assume the ratio of paying to free users are the same across groups - though we can check easily 
+
+# 3) Final recommendation
+It is recommended to keep manual elevations (for the distinct query, user_tier, media_type) as the engagement rate (which refers to the number of customers exporting and/or paying for a license as a proportion of total customers that have clicked) is higher for group A as to group B. 
+
+It is important to note that this recommendation is made explicitly maximize customer conversions as opposed to a more pragmatic approach which may also consider trade-offs and deficiencies of maintaining a manual elevation workflow. 
